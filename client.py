@@ -154,7 +154,8 @@ async def main(listen, uri, passwd_file, certfile, client_cert, idle_timeout):
     protocol, local_addr = listen.split('://', maxsplit=1)
     local_addr = local_addr.split(':', maxsplit=1)
     local_addr = (local_addr[0], int(local_addr[1]))
-    uri = update_url_with_passwd(uri, get_passwd_from_file(passwd_file))
+    if passwd_file:
+        uri = update_url_with_passwd(uri, get_passwd_from_file(passwd_file))
     if not uri.startswith('wss://'):
         logger.warning('Secure connection is disabled')
     loop = asyncio.get_running_loop()
