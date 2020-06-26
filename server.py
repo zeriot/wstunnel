@@ -98,6 +98,7 @@ async def ws_server(ws, path, routes, idle_timeout):
     try:
         upstream_proto, upstream_addr, expected_token = routes[path.path]
     except KeyError:
+        logger.info(f'Rejected Websocket connection from {peername}: no route')
         return
     if not verify_token(expected_token, received_token, default=True):
         logger.info(f'Rejected Websocket connection from {peername}: password mismatch')
@@ -139,7 +140,7 @@ async def ws_server(ws, path, routes, idle_timeout):
         for t in tasks:
             t.cancel()
         transport.close()
-        logger.debug(f"Connection {peername} is terminated")
+        logger.debug(f"Connection from {peername} is terminated")
 
 Route = namedtuple('Route', ['protocol', 'endpoint', 'token'])
 
