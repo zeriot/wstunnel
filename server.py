@@ -33,8 +33,9 @@ class Watchdog:
                 raise self.exc
 
 class UdpClient:
-    def __init__(self, que, peer_addr):
+    def __init__(self, que, conn_lost, peer_addr):
         self.que = que
+        self.conn_lost = conn_lost
         self.peer_addr = peer_addr
         self.transport = None
     
@@ -49,13 +50,21 @@ class UdpClient:
     
     def error_received(self, exc):
         logger.debug(f"UdpClient.error_received: {repr(exc)}")
+        self.report_conn_lost()
     
     def connection_lost(self, exc):
         logger.debug(f"UdpClient.connection_lost: {repr(exc)}")
+        self.report_conn_lost()
+    
+    def report_conn_lost(self):
+        if not self.conn_lost.done():
+            self.conn_lost.set_result(True)
 
 class TcpClient(asyncio.Protocol):
-    def __init__(self, que):
+    def __init__(self, que, conn_lost, peer_addr):
         self.que = que
+        self.conn_lost = conn_lost
+        self.peer_addr = peer_addr
         self.transport = None
     
     def connection_made(self, transport):
@@ -66,6 +75,10 @@ class TcpClient(asyncio.Protocol):
     
     def connection_lost(self, exc):
         logger.debug(f"TcpClient.connection_lost: {repr(exc)}")
+        self.report_conn_lost()
+    
+    def report_conn_lost(self):
+        self.conn_lost.set_result(True)
 
 async def ws_data_sender(ws, que, watchdog):
     while True:
@@ -100,38 +113,41 @@ async def ws_server(ws, path, routes, idle_timeout):
     except KeyError:
         logger.info(f'Rejected Websocket connection from {peername}: no route')
         return
-    if not verify_token(expected_token, received_token, default=True):
-        logger.info(f'Rejected Websocket connection from {peername}: password mismatch')
-        return
-    logger.info(f'Accepted Websocket connection from {peername}')
-    que = asyncio.Queue()
-    loop = asyncio.get_running_loop()
     try:
+        if not verify_token(expected_token, received_token, default=True):
+            logger.info(f'Rejected Websocket connection from {peername}: password mismatch')
+            return
+        logger.info(f'Accepted Websocket connection from {peername}')
+        que = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        conn_lost = loop.create_future()
         if upstream_proto == 'udp':
-            transport, protocol = await loop.create_datagram_endpoint(
-                lambda: UdpClient(que, upstream_addr),
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: UdpClient(que, conn_lost, upstream_addr),
                 remote_addr=upstream_addr)
             f_write_to_transport = transport.sendto
             
         else:
-            transport, protocol = await loop.create_connection(
-                lambda: TcpClient(que),
+            transport, _ = await loop.create_connection(
+                lambda: TcpClient(que, conn_lost, upstream_addr),
                 upstream_addr[0], upstream_addr[1])
             f_write_to_transport = transport.write
     except Exception as e:
         logger.error(repr(e))
         return
-    if idle_timeout:
-        watchdog = Watchdog(idle_timeout, ConnIdleTimeout(f"Connection from {peername} has idled"))
-    else:
-        watchdog = None
-    tasks = [asyncio.create_task(ws_data_receiver(ws, f_write_to_transport, watchdog)),
-             asyncio.create_task(ws_data_sender(ws, que, watchdog))
-            ]
-    if watchdog:
-        tasks.append(asyncio.create_task(watchdog.start()))
+    tasks = []
     try:
-        await asyncio.gather(*tasks)
+        if idle_timeout:
+            watchdog = Watchdog(idle_timeout, ConnIdleTimeout(f"Connection from {peername} has idled"))
+            tasks.append(asyncio.create_task(watchdog.start()))
+        else:
+            watchdog = None
+        tasks.append(asyncio.create_task(ws_data_receiver(ws, f_write_to_transport, watchdog)))
+        tasks.append(asyncio.create_task(ws_data_sender(ws, que, watchdog)))
+        done, _ = await asyncio.wait({conn_lost, *tasks}, return_when = 'FIRST_COMPLETED')
+        exc = done.pop().exception()
+        if exc:
+            raise exc
     except ConnIdleTimeout as e:
         logger.info(repr(e))
     except Exception as e:
@@ -186,8 +202,8 @@ if __name__ == "__main__":
     parser.add_argument('-l', '--listen', type=str, required=True, help='Listen address')
     parser.add_argument('-r', '--routes', type=str, metavar='routes.json', required=True, help='File defining paths and upstream servers')
     parser.add_argument('-i', '--idle-timeout', type=int, default=120, help='Seconds to wait before an idle connection being killed')
-    parser.add_argument('-s', '--cert', type=str, metavar='server.pem', help='Server certificate with private key')
-    parser.add_argument('-c', '--client-ca', type=str, metavar='ca.crt', help='Client CA certificates to verify against')
+    parser.add_argument('-s', '--cert', type=str, metavar='server.pem', help='Server certificate in PEM format with private key')
+    parser.add_argument('-c', '--client-ca', type=str, metavar='ca.pem', help='Client CA certificates in PEM format to verify against')
     parser.add_argument('--log-file', type=str, metavar='FILE', help='Log to FILE')
     parser.add_argument('--log-level', type=str, default="info", choices=['debug', 'info'], help='Log level')
     args = parser.parse_args()

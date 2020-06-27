@@ -29,33 +29,43 @@ class Watchdog:
                 raise self.exc
 
 class BaseServer:
-    def __init__(self, uri, certfile, client_cert, idle_timeout = None):
-        self.uri = uri
-        self.idle_timeout = idle_timeout
+    '''
+    Handle one client
+    Start websocket connection
+    Spin up tasks for forwarding traffic
+    Shutdown on error
+    '''
+    def __init__(self, client, f_write_to_transport, f_conn_lost, uri, certfile, client_cert, idle_timeout):
+        self.client = client
         self.shutdown = asyncio.get_running_loop().create_future()
-        self.transport = None
+        self.que = asyncio.Queue()
         if uri.startswith('wss://'):
             ssl_context = ssl.create_default_context(cafile = certfile)
             ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
             if client_cert:
                 ssl_context.load_cert_chain(client_cert)
-            self.ssl_param = {'ssl': ssl_context}
+            ssl_param = {'ssl': ssl_context}
         else:
-            self.ssl_param = dict()
+            ssl_param = dict()
+        asyncio.create_task(self.new_client(uri, ssl_param, f_write_to_transport, f_conn_lost, idle_timeout))
     
-    async def new_client(self, que, peername):
-        if self.idle_timeout:
-            watchdog = Watchdog(self.idle_timeout, ConnIdleTimeout(f"Connection {peername} has idled"))
-        else:
-            watchdog = None
+    def data_received(self, data):
+        self.que.put_nowait(data)
+    
+    def abort(self):
+        self.shutdown.set_result(True)
+    
+    async def new_client(self, uri, ssl_param, f_write_to_transport, f_conn_lost, idle_timeout):
         tasks = []
         try:
-            async with websockets.connect(self.uri, **self.ssl_param) as ws:
-                tasks = [asyncio.create_task(self.ws_data_sender(ws, que, watchdog)),
-                         asyncio.create_task(self.ws_data_receiver(ws, peername, watchdog))
-                        ]
-                if watchdog:
+            async with websockets.connect(uri, **ssl_param) as ws:
+                if idle_timeout:
+                    watchdog = Watchdog(idle_timeout, ConnIdleTimeout(f"Connection {self.client} has idled"))
                     tasks.append(asyncio.create_task(watchdog.start()))
+                else:
+                    watchdog = None
+                tasks.append(asyncio.create_task(self.ws_data_sender(ws, watchdog)))
+                tasks.append(asyncio.create_task(self.ws_data_receiver(ws, f_write_to_transport, watchdog)))
                 done, _ = await asyncio.wait({self.shutdown, *tasks}, return_when = 'FIRST_COMPLETED')
                 exc = done.pop().exception()
                 if exc:
@@ -65,81 +75,82 @@ class BaseServer:
         except Exception as e:
             logger.error(repr(e))
         finally:
-            self.client_lost(peername)
             for t in tasks:
                 t.cancel()
+            if not self.shutdown.done():
+                f_conn_lost(self.client)
     
-    async def ws_data_sender(self, ws, que, watchdog):
+    async def ws_data_sender(self, ws, watchdog):
+        que = self.que
         while True:
             if watchdog:
                 watchdog.reset()
             await ws.send(await que.get())
             que.task_done()
     
-    async def ws_data_receiver(self, ws, peername, watchdog):
+    async def ws_data_receiver(self, ws, f_write_to_transport, watchdog):
         while True:
             if watchdog:
                 watchdog.reset()
-            self.write_to_transport(await ws.recv(), peername)
-    
-    def write_to_transport(self, data, peername):
-        raise NotImplementedError()
-    
-    def client_lost(self, peername):
-        pass
+            f_write_to_transport(await ws.recv(), self.client)
 
-class UdpServer(BaseServer):
-    def __init__(self, *args):
-        self.que = dict()
-        super().__init__(uri, *args)
+class UdpServer:
+    def __init__(self, uri, certfile, client_cert, idle_timeout):
+        self.base_servers = dict()
+        self.args = [uri, certfile, client_cert, idle_timeout]
     
     def connection_made(self, transport):
         self.transport = transport
     
     def datagram_received(self, data, addr):
-        if addr in self.que:
-            self.que[addr].put_nowait(data)
-            return
-        logger.info(f'New UDP connection from {addr}')
-        que = self.que[addr] = asyncio.Queue()
-        que.put_nowait(data)
-        asyncio.create_task(self.new_client(que, addr))
+        try:
+            base = self.base_servers[addr]
+        except KeyError:
+            logger.info(f'New UDP connection from {addr}')
+            base = self.base_servers[addr] = BaseServer(addr,
+                                                        self.transport.sendto,
+                                                        self.upstream_lost,
+                                                        *self.args
+                                                       )
+        base.data_received(data)
     
     def write_to_transport(self, data, addr):
         self.transport.sendto(data, addr)
     
-    def client_lost(self, peername):
-        self.que.pop(peername)
-        logger.debug(f'UDP connection from {peername} is lost')
+    def upstream_lost(self, addr):
+        logger.info(f'Upstream connection for UDP client {addr} is gone')
+        self.base_servers.pop(addr)
 
-class ProtocolWrapper(asyncio.Protocol):
-    def __init__(self, *l, **d):
+class TcpServer(asyncio.Protocol):
+    def __init__(self, uri, certfile, client_cert, idle_timeout):
+        self.args = [uri, certfile, client_cert, idle_timeout]
+        self.peername = None
+        self.base = None
+        self.transport = None
         super().__init__()
-
-class TcpServer(BaseServer, ProtocolWrapper):
-    def __init__(self, *args):
-        super().__init__(*args)
     
     def connection_made(self, transport):
-        peername = transport.get_extra_info('peername')
+        peername = self.peername = transport.get_extra_info('peername')
         logger.info(f'New TCP connection from {peername}')
         self.transport = transport
-        self.que = asyncio.Queue()
-        asyncio.create_task(self.new_client(self.que, peername))
+        self.base = BaseServer(peername,
+                               self.write_to_transport,
+                               self.upstream_lost,
+                               *self.args
+                              )
     
     def data_received(self, data):
-        self.que.put_nowait(data)
+        self.base.data_received(data)
     
     def connection_lost(self, exc):
-        self.shutdown.set_result(True)
-        logger.debug(f'TcpServer.connection_lost: {repr(exc)}')
+        logger.info(f'TCP connection from {self.peername} is down: {repr(exc)}')
+        self.base.abort()
     
     def write_to_transport(self, data, addr):
         self.transport.write(data)
     
-    def client_lost(self, peername):
+    def upstream_lost(self, peername):
         self.transport.close()
-        logger.debug(f'TCP connection from {peername} is lost')
 
 def get_passwd_from_file(path):
     with open(path, 'r') as fi:
@@ -164,7 +175,7 @@ async def main(listen, uri, passwd_file, certfile, client_cert, idle_timeout):
                                                            local_addr = local_addr
                                                           )
         try:
-            await loop.create_future()
+            await loop.create_future() # Serve forever
         finally:
             transport.close()
     else:
@@ -180,8 +191,8 @@ if __name__ == "__main__":
     parser.add_argument('-l', '--listen', type=str, required=True, help='Listen address')
     parser.add_argument('-p', '--passwd', type=str, metavar='FILE', help='File containing one line of password to authenticate to the proxy server')
     parser.add_argument('-i', '--idle-timeout', type=int, default=120, help='Seconds to wait before an idle UDP connection being killed')
-    parser.add_argument('-s', '--ca-certs', type=str, metavar='ca.crt', help="Server CA certificates to verify against")
-    parser.add_argument('-c', '--client-cert', type=str, metavar='client.pem', help="Client certificate with private key")
+    parser.add_argument('-s', '--ca-certs', type=str, metavar='ca.pem', help="Server CA certificates in PEM format to verify against")
+    parser.add_argument('-c', '--client-cert', type=str, metavar='client.pem', help="Client certificate in PEM format with private key")
     parser.add_argument('--log-file', type=str, metavar='FILE', help='Log to FILE')
     parser.add_argument('--log-level', type=str, default="info", choices=['debug', 'info'], help='Log level')
     args = parser.parse_args()
