@@ -194,10 +194,17 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--ca-certs', type=str, metavar='ca.pem', help="Server CA certificates in PEM format to verify against")
     parser.add_argument('-c', '--client-cert', type=str, metavar='client.pem', help="Client certificate in PEM format with private key")
     parser.add_argument('--log-file', type=str, metavar='FILE', help='Log to FILE')
-    parser.add_argument('--log-level', type=str, default="info", choices=['debug', 'info'], help='Log level')
+    parser.add_argument('--log-level', type=str, default="info", choices=['debug', 'info', 'error', 'critical'], help='Log level')
     args = parser.parse_args()
-    log_level = logging.DEBUG if args.log_level == 'debug' else logging.INFO
-    logging_config_param = {'format': '%(levelname)s::%(asctime)s::%(name)s::%(filename)s:%(lineno)d::%(message)s',
+    if args.log_level == 'debug':
+        log_level = logging.DEBUG
+    elif args.log_level == 'error':
+        log_level = logging.ERROR
+    elif args.log_level == 'critical':
+        log_level = logging.CRITICAL
+    else:
+        log_level = logging.INFO
+    logging_config_param = {'format': '%(levelname)s::%(asctime)s::%(filename)s:%(lineno)d::%(message)s',
                             'datefmt': '%Y-%m-%d %H:%M:%S'
                            }
     if args.log_file:
