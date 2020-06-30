@@ -4,6 +4,7 @@ import logging
 import argparse
 import ssl
 from urllib.parse import urlencode, urlparse, urlunparse
+import constants
 # https://github.com/aaugustin/websockets
 import websockets
 
@@ -35,9 +36,9 @@ class BaseServer:
     Spin up tasks for forwarding traffic
     Shutdown on error
     '''
-    def __init__(self, client, f_write_to_transport, f_conn_lost, uri, certfile, client_cert, idle_timeout):
+    def __init__(self, client, f_write_to_transport, f_conn_lost, uri, certfile, client_cert, idle_timeout, compress):
         self.client = client
-        self.shutdown = asyncio.get_running_loop().create_future()
+        self.done = False
         self.que = asyncio.Queue()
         if uri.startswith('wss://'):
             ssl_context = ssl.create_default_context(cafile = certfile)
@@ -47,18 +48,25 @@ class BaseServer:
             ssl_param = {'ssl': ssl_context}
         else:
             ssl_param = dict()
-        asyncio.create_task(self.new_client(uri, ssl_param, f_write_to_transport, f_conn_lost, idle_timeout))
+        asyncio.create_task(self.new_client(uri, ssl_param, f_write_to_transport, f_conn_lost, idle_timeout, compress))
     
     def data_received(self, data):
-        self.que.put_nowait(data)
+        mv = memoryview(data)
+        M = constants.WS_MAX_MSG_SIZE
+        for i in range(0, len(data), M):
+            self.que.put_nowait(mv[i:i+M])
     
-    def abort(self):
-        self.shutdown.set_result(True)
+    def shutdown(self):
+        self.done = True
+        self.que.put_nowait(None)
     
-    async def new_client(self, uri, ssl_param, f_write_to_transport, f_conn_lost, idle_timeout):
+    async def new_client(self, uri, ssl_param, f_write_to_transport, f_conn_lost, idle_timeout, compress):
         tasks = []
         try:
-            async with websockets.connect(uri, **ssl_param) as ws:
+            async with websockets.connect(uri,
+                                          max_size = constants.WS_MAX_MSG_SIZE_COMP, max_queue = None,
+                                          compression = compress,
+                                          **ssl_param) as ws:
                 if idle_timeout:
                     watchdog = Watchdog(idle_timeout, ConnIdleTimeout(f"Connection {self.client} has idled"))
                     tasks.append(asyncio.create_task(watchdog.start()))
@@ -66,18 +74,20 @@ class BaseServer:
                     watchdog = None
                 tasks.append(asyncio.create_task(self.ws_data_sender(ws, watchdog)))
                 tasks.append(asyncio.create_task(self.ws_data_receiver(ws, f_write_to_transport, watchdog)))
-                done, _ = await asyncio.wait({self.shutdown, *tasks}, return_when = 'FIRST_COMPLETED')
-                exc = done.pop().exception()
-                if exc:
-                    raise exc
-        except ConnIdleTimeout as e:
+                done, _ = await asyncio.wait(tasks, return_when = 'FIRST_COMPLETED')
+                for i in done:
+                    exc = i.exception()
+                    if exc:
+                        raise exc
+        except (ConnIdleTimeout,
+                websockets.exceptions.ConnectionClosedOK) as e:
             logger.info(repr(e))
         except Exception as e:
-            logger.error(repr(e))
+            logger.error(repr(e), exc_info = True)
         finally:
             for t in tasks:
                 t.cancel()
-            if not self.shutdown.done():
+            if not self.done:
                 f_conn_lost(self.client)
     
     async def ws_data_sender(self, ws, watchdog):
@@ -85,7 +95,11 @@ class BaseServer:
         while True:
             if watchdog:
                 watchdog.reset()
-            await ws.send(await que.get())
+            data = await que.get()
+            if data is None:
+                que.task_done()
+                return
+            await ws.send(data)
             que.task_done()
     
     async def ws_data_receiver(self, ws, f_write_to_transport, watchdog):
@@ -95,9 +109,9 @@ class BaseServer:
             f_write_to_transport(await ws.recv(), self.client)
 
 class UdpServer:
-    def __init__(self, uri, certfile, client_cert, idle_timeout):
+    def __init__(self, uri, certfile, client_cert, idle_timeout, compress):
         self.base_servers = dict()
-        self.args = [uri, certfile, client_cert, idle_timeout]
+        self.args = [uri, certfile, client_cert, idle_timeout, compress]
     
     def connection_made(self, transport):
         self.transport = transport
@@ -122,8 +136,8 @@ class UdpServer:
         self.base_servers.pop(addr)
 
 class TcpServer(asyncio.Protocol):
-    def __init__(self, uri, certfile, client_cert, idle_timeout):
-        self.args = [uri, certfile, client_cert, idle_timeout]
+    def __init__(self, uri, certfile, client_cert, idle_timeout, compress):
+        self.args = [uri, certfile, client_cert, idle_timeout, compress]
         self.peername = None
         self.base = None
         self.transport = None
@@ -144,7 +158,7 @@ class TcpServer(asyncio.Protocol):
     
     def connection_lost(self, exc):
         logger.info(f'TCP connection from {self.peername} is down: {repr(exc)}')
-        self.base.abort()
+        self.base.shutdown()
     
     def write_to_transport(self, data, addr):
         self.transport.write(data)
@@ -161,17 +175,22 @@ def update_url_with_passwd(url, passwd):
     url = url._replace(query = urlencode({'t': passwd}))
     return urlunparse(url)
 
-async def main(listen, uri, passwd_file, certfile, client_cert, idle_timeout):
-    protocol, local_addr = listen.split('://', maxsplit=1)
+async def main(args):
+    protocol, local_addr = args.listen.split('://', maxsplit=1)
     local_addr = local_addr.split(':', maxsplit=1)
     local_addr = (local_addr[0], int(local_addr[1]))
-    if passwd_file:
-        uri = update_url_with_passwd(uri, get_passwd_from_file(passwd_file))
+    if args.passwd:
+        uri = update_url_with_passwd(args.url, get_passwd_from_file(args.passwd))
     if not uri.startswith('wss://'):
         logger.warning('Secure connection is disabled')
+    compress = 'deflate' if args.enable_compress else None
     loop = asyncio.get_running_loop()
     if protocol == 'udp':
-        transport, _ = await loop.create_datagram_endpoint(lambda: UdpServer(uri, certfile, client_cert, idle_timeout),
+        transport, _ = await loop.create_datagram_endpoint(lambda: UdpServer(uri,
+                                                                             args.ca_certs,
+                                                                             args.client_cert,
+                                                                             args.idle_timeout,
+                                                                             compress),
                                                            local_addr = local_addr
                                                           )
         try:
@@ -179,7 +198,11 @@ async def main(listen, uri, passwd_file, certfile, client_cert, idle_timeout):
         finally:
             transport.close()
     else:
-        server = await loop.create_server(lambda: TcpServer(uri, certfile, client_cert, idle_timeout),
+        server = await loop.create_server(lambda: TcpServer(uri,
+                                                            args.ca_certs,
+                                                            args.client_cert,
+                                                            args.idle_timeout,
+                                                            compress),
                                           local_addr[0], local_addr[1]
                                          )
         async with server:
@@ -193,6 +216,7 @@ if __name__ == "__main__":
     parser.add_argument('-i', '--idle-timeout', type=int, default=120, help='Seconds to wait before an idle UDP connection being killed')
     parser.add_argument('-s', '--ca-certs', type=str, metavar='ca.pem', help="Server CA certificates in PEM format to verify against")
     parser.add_argument('-c', '--client-cert', type=str, metavar='client.pem', help="Client certificate in PEM format with private key")
+    parser.add_argument('--enable-compress', type=bool, const=True, nargs='?', help='Compress data before sending')
     parser.add_argument('--log-file', type=str, metavar='FILE', help='Log to FILE')
     parser.add_argument('--log-level', type=str, default="info", choices=['debug', 'info', 'error', 'critical'], help='Log level')
     args = parser.parse_args()
@@ -211,4 +235,4 @@ if __name__ == "__main__":
         logging_config_param['filename'] = args.log_file
     logging.basicConfig(**logging_config_param)
     logging.getLogger(__name__).setLevel(log_level)
-    asyncio.run(main(args.listen, args.url, args.passwd, args.ca_certs, args.client_cert, args.idle_timeout))
+    asyncio.run(main(args))

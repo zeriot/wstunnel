@@ -8,6 +8,7 @@ import json
 import hmac
 from urllib.parse import urlparse, parse_qs
 from collections import namedtuple
+import constants
 # https://github.com/aaugustin/websockets
 import websockets
 
@@ -33,9 +34,8 @@ class Watchdog:
                 raise self.exc
 
 class UdpClient:
-    def __init__(self, que, conn_lost, peer_addr):
+    def __init__(self, que, peer_addr):
         self.que = que
-        self.conn_lost = conn_lost
         self.peer_addr = peer_addr
         self.transport = None
     
@@ -46,24 +46,24 @@ class UdpClient:
         if self.peer_addr != addr:
             logger.warning(f'Dropped data from {addr}')
             return
-        self.que.put_nowait(data)
+        mv = memoryview(data)
+        M = constants.WS_MAX_MSG_SIZE
+        for i in range(0, len(data), M):
+            self.que.put_nowait(mv[i:i+M])
     
     def error_received(self, exc):
         logger.debug(f"UdpClient.error_received: {repr(exc)}")
-        self.report_conn_lost()
     
     def connection_lost(self, exc):
         logger.debug(f"UdpClient.connection_lost: {repr(exc)}")
-        self.report_conn_lost()
+        self.write_eof_to_que()
     
-    def report_conn_lost(self):
-        if not self.conn_lost.done():
-            self.conn_lost.set_result(True)
+    def write_eof_to_que(self):
+        self.que.put_nowait(None)
 
 class TcpClient(asyncio.Protocol):
-    def __init__(self, que, conn_lost, peer_addr):
+    def __init__(self, que, peer_addr):
         self.que = que
-        self.conn_lost = conn_lost
         self.peer_addr = peer_addr
         self.transport = None
     
@@ -71,20 +71,27 @@ class TcpClient(asyncio.Protocol):
         self.transport = transport
     
     def data_received(self, data):
-        self.que.put_nowait(data)
+        mv = memoryview(data)
+        M = constants.WS_MAX_MSG_SIZE
+        for i in range(0, len(data), M):
+            self.que.put_nowait(mv[i:i+M])
     
     def connection_lost(self, exc):
         logger.debug(f"TcpClient.connection_lost: {repr(exc)}")
-        self.report_conn_lost()
+        self.write_eof_to_que()
     
-    def report_conn_lost(self):
-        self.conn_lost.set_result(True)
+    def write_eof_to_que(self):
+        self.que.put_nowait(None)
 
 async def ws_data_sender(ws, que, watchdog):
     while True:
         if watchdog:
             watchdog.reset()
-        await ws.send(await que.get())
+        data = await que.get()
+        if data is None:
+            que.task_done()
+            return
+        await ws.send(data)
         que.task_done()
 
 async def ws_data_receiver(ws, f_write_to_transport, watchdog):
@@ -120,20 +127,18 @@ async def ws_server(ws, path, routes, idle_timeout):
         logger.info(f'Accepted Websocket connection from {peername}')
         que = asyncio.Queue()
         loop = asyncio.get_running_loop()
-        conn_lost = loop.create_future()
         if upstream_proto == 'udp':
             transport, _ = await loop.create_datagram_endpoint(
-                lambda: UdpClient(que, conn_lost, upstream_addr),
+                lambda: UdpClient(que, upstream_addr),
                 remote_addr=upstream_addr)
             f_write_to_transport = transport.sendto
-            
         else:
             transport, _ = await loop.create_connection(
-                lambda: TcpClient(que, conn_lost, upstream_addr),
+                lambda: TcpClient(que, upstream_addr),
                 upstream_addr[0], upstream_addr[1])
             f_write_to_transport = transport.write
     except Exception as e:
-        logger.error(repr(e))
+        logger.error(repr(e), exc_info = True)
         return
     tasks = []
     try:
@@ -144,11 +149,13 @@ async def ws_server(ws, path, routes, idle_timeout):
             watchdog = None
         tasks.append(asyncio.create_task(ws_data_receiver(ws, f_write_to_transport, watchdog)))
         tasks.append(asyncio.create_task(ws_data_sender(ws, que, watchdog)))
-        done, _ = await asyncio.wait({conn_lost, *tasks}, return_when = 'FIRST_COMPLETED')
-        exc = done.pop().exception()
-        if exc:
-            raise exc
-    except ConnIdleTimeout as e:
+        done, _ = await asyncio.wait(tasks, return_when = 'FIRST_COMPLETED')
+        for i in done:
+            exc = i.exception()
+            if exc:
+                raise exc
+    except (ConnIdleTimeout,
+            websockets.exceptions.ConnectionClosedOK) as e:
         logger.info(repr(e))
     except Exception as e:
         logger.error(repr(e))
@@ -176,25 +183,29 @@ def parse_routes(routes_json):
         ret[k] = Route(protocol, tuple(endpoint), token)
     return ret
 
-def main(local_addr, cert, clientcert, routes_json, idle_timeout):
-    local_addr = local_addr.split(':', 1)
+def main(args):
+    local_addr = args.listen.split(':', 1)
     local_addr[1] = int(local_addr[1])
-    routes = parse_routes(routes_json)
-    ws_server_bound = functools.partial(ws_server, routes=routes, idle_timeout=idle_timeout)
-    if cert:
+    routes = parse_routes(args.routes)
+    ws_server_bound = functools.partial(ws_server, routes=routes, idle_timeout=args.idle_timeout)
+    if args.cert:
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
         ssl_context.options |= ssl.OP_NO_TICKET
-        ssl_context.load_cert_chain(cert)
-        if clientcert:
+        ssl_context.load_cert_chain(args.cert)
+        if args.client_ca:
             ssl_context.verify_mode = ssl.CERT_REQUIRED
-            ssl_context.load_verify_locations(cafile = clientcert)
+            ssl_context.load_verify_locations(cafile = args.client_ca)
         ssl_param = {'ssl': ssl_context}
     else:
         logger.warning('Secure connection is disabled')
         ssl_param = dict()
     asyncio.get_event_loop().run_until_complete(
-        websockets.serve(ws_server_bound, local_addr[0], local_addr[1], **ssl_param))
+        websockets.serve(ws_server_bound,
+                         local_addr[0], local_addr[1],
+                         max_size = constants.WS_MAX_MSG_SIZE_COMP, max_queue = None,
+                         compression = 'deflate' if args.enable_compress else None,
+                         **ssl_param))
     asyncio.get_event_loop().run_forever()
 
 if __name__ == "__main__":
@@ -204,6 +215,7 @@ if __name__ == "__main__":
     parser.add_argument('-i', '--idle-timeout', type=int, default=120, help='Seconds to wait before an idle connection being killed')
     parser.add_argument('-s', '--cert', type=str, metavar='server.pem', help='Server certificate in PEM format with private key')
     parser.add_argument('-c', '--client-ca', type=str, metavar='ca.pem', help='Client CA certificates in PEM format to verify against')
+    parser.add_argument('--enable-compress', type=bool, const=True, nargs='?', help='Compress data before sending')
     parser.add_argument('--log-file', type=str, metavar='FILE', help='Log to FILE')
     parser.add_argument('--log-level', type=str, default="info", choices=['debug', 'info', 'error', 'critical'], help='Log level')
     args = parser.parse_args()
@@ -222,4 +234,4 @@ if __name__ == "__main__":
         logging_config_param['filename'] = args.log_file
     logging.basicConfig(**logging_config_param)
     logging.getLogger(__name__).setLevel(log_level)
-    main(args.listen, args.cert, args.client_ca, args.routes, args.idle_timeout)
+    main(args)
