@@ -210,7 +210,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Wstunnel server')
-    parser.add_argument('-l', '--listen', type=str, required=True, help='Listen address')
+    parser.add_argument('-l', '--listen', type=str, metavar='IP:PORT', required=True, help='Listen address')
     parser.add_argument('-r', '--routes', type=str, metavar='routes.json', required=True, help='File defining paths and upstream servers')
     parser.add_argument('-i', '--idle-timeout', type=int, default=120, help='Seconds to wait before an idle connection being killed')
     parser.add_argument('-s', '--cert', type=str, metavar='server.pem', help='Server certificate in PEM format with private key')

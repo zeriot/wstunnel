@@ -30,12 +30,6 @@ class Watchdog:
                 raise self.exc
 
 class BaseServer:
-    '''
-    Handle one client
-    Start websocket connection
-    Spin up tasks for forwarding traffic
-    Shutdown on error
-    '''
     def __init__(self, client, f_write_to_transport, f_conn_lost, uri, certfile, client_cert, idle_timeout, compress):
         self.client = client
         self.done = False
@@ -181,6 +175,8 @@ async def main(args):
     local_addr = (local_addr[0], int(local_addr[1]))
     if args.passwd:
         uri = update_url_with_passwd(args.url, get_passwd_from_file(args.passwd))
+    else:
+        uri = args.url
     if not uri.startswith('wss://'):
         logger.warning('Secure connection is disabled')
     compress = 'deflate' if args.enable_compress else None
@@ -210,10 +206,10 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Wstunnel client')
-    parser.add_argument('--url', type=str, required=True, help='URL')
-    parser.add_argument('-l', '--listen', type=str, required=True, help='Listen address')
+    parser.add_argument('--url', type=str, metavar='ws[s]://HOSTNAME:PORT/PATH', required=True, help='URL')
+    parser.add_argument('-l', '--listen', type=str, metavar='(tcp|udp)://IP:PORT', required=True, help='Listen address')
     parser.add_argument('-p', '--passwd', type=str, metavar='FILE', help='File containing one line of password to authenticate to the proxy server')
-    parser.add_argument('-i', '--idle-timeout', type=int, default=120, help='Seconds to wait before an idle UDP connection being killed')
+    parser.add_argument('-i', '--idle-timeout', type=int, default=120, help='Seconds to wait before an idle connection being killed')
     parser.add_argument('-s', '--ca-certs', type=str, metavar='ca.pem', help="Server CA certificates in PEM format to verify against")
     parser.add_argument('-c', '--client-cert', type=str, metavar='client.pem', help="Client certificate in PEM format with private key")
     parser.add_argument('--enable-compress', type=bool, const=True, nargs='?', help='Compress data before sending')
