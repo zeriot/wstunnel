@@ -12,6 +12,6 @@ else
 fi
 openssl req -new -sha256 -key "${S}.key" -out "${S}.csr"
 openssl req -x509 -sha256 -days 730 -key "${S}.key" -in "${S}.csr" -out "${S}.crt"
-rm -f "${S}.csr"
 cat "${S}.key" "${S}.crt" > "${S}.pem"
+rm -f "${S}.csr" "${S}.key"
 echo "Then copy ${S}.crt to the other side"
