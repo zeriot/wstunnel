@@ -12,26 +12,9 @@ import constants
 # https://github.com/aaugustin/websockets
 import websockets
 
+import watchdog as wd
+
 logger = logging.getLogger(__name__)
-
-class ConnIdleTimeout(Exception):
-    pass
-
-class Watchdog:
-    def __init__(self, timeout, exc):
-        self.timeout = timeout
-        self.cnt = 0
-        self.exc = exc
-    
-    def reset(self):
-        self.cnt = 0
-    
-    async def start(self):
-        while True:
-            await asyncio.sleep(1)
-            self.cnt += 1
-            if self.cnt == self.timeout:
-                raise self.exc
 
 class UdpClient:
     def __init__(self, que, peer_addr):
@@ -44,12 +27,8 @@ class UdpClient:
     
     def datagram_received(self, data, addr):
         if self.peer_addr != addr:
-            logger.warning(f'Dropped data from {addr}')
             return
-        mv = memoryview(data)
-        M = constants.WS_MAX_MSG_SIZE
-        for i in range(0, len(data), M):
-            self.que.put_nowait(mv[i:i+M])
+        self.que.put_nowait(memoryview(data))
     
     def error_received(self, exc):
         logger.debug(f"UdpClient.error_received: {repr(exc)}")
@@ -71,10 +50,7 @@ class TcpClient(asyncio.Protocol):
         self.transport = transport
     
     def data_received(self, data):
-        mv = memoryview(data)
-        M = constants.WS_MAX_MSG_SIZE
-        for i in range(0, len(data), M):
-            self.que.put_nowait(mv[i:i+M])
+        self.que.put_nowait(memoryview(data))
     
     def connection_lost(self, exc):
         logger.debug(f"TcpClient.connection_lost: {repr(exc)}")
@@ -84,6 +60,7 @@ class TcpClient(asyncio.Protocol):
         self.que.put_nowait(None)
 
 async def ws_data_sender(ws, que, watchdog):
+    M = constants.WS_MAX_MSG_SIZE
     while True:
         if watchdog:
             watchdog.reset()
@@ -91,14 +68,15 @@ async def ws_data_sender(ws, que, watchdog):
         if data is None:
             que.task_done()
             return
-        await ws.send(data)
+        for i in range(0, len(data), M):
+            await ws.send(data[i:i+M])
         que.task_done()
 
 async def ws_data_receiver(ws, f_write_to_transport, watchdog):
-    while True:
+    async for data in ws:
         if watchdog:
             watchdog.reset()
-        f_write_to_transport(await ws.recv())
+        f_write_to_transport(data)
 
 def verify_token(expected, received, default):
     if expected is None:
@@ -107,7 +85,7 @@ def verify_token(expected, received, default):
         return False
     return hmac.compare_digest(expected, received)
 
-async def ws_server(ws, path, routes, idle_timeout):
+async def ws_server(ws, path, routes, idle_timeout, watchdog_server):
     peername = ws.transport.get_extra_info("peername")
     logger.debug(f'New Websocket connection from {peername}, path={path}')
     path = urlparse(path)
@@ -143,8 +121,10 @@ async def ws_server(ws, path, routes, idle_timeout):
     tasks = []
     try:
         if idle_timeout:
-            watchdog = Watchdog(idle_timeout, ConnIdleTimeout(f"Connection from {peername} has idled"))
-            tasks.append(asyncio.create_task(watchdog.start()))
+            watchdog = wd.WatchdogClient(watchdog_server,
+                                         idle_timeout,
+                                         wd.IdleTimeout(f"Connection from {peername} has idled"))
+            tasks.append(watchdog.start())
         else:
             watchdog = None
         tasks.append(asyncio.create_task(ws_data_receiver(ws, f_write_to_transport, watchdog)))
@@ -154,7 +134,7 @@ async def ws_server(ws, path, routes, idle_timeout):
             exc = i.exception()
             if exc:
                 raise exc
-    except (ConnIdleTimeout,
+    except (wd.IdleTimeout,
             websockets.exceptions.ConnectionClosedOK) as e:
         logger.info(repr(e))
     except Exception as e:
@@ -187,7 +167,6 @@ def main(args):
     local_addr = args.listen.split(':', 1)
     local_addr[1] = int(local_addr[1])
     routes = parse_routes(args.routes)
-    ws_server_bound = functools.partial(ws_server, routes=routes, idle_timeout=args.idle_timeout)
     if args.cert:
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -200,13 +179,19 @@ def main(args):
     else:
         logger.warning('Secure connection is disabled')
         ssl_param = dict()
-    asyncio.get_event_loop().run_until_complete(
+    loop = asyncio.get_event_loop()
+    watchdog_server = wd.WatchdogServer(loop).start()
+    ws_server_bound = functools.partial(ws_server,
+                                        routes=routes,
+                                        idle_timeout=args.idle_timeout,
+                                        watchdog_server = watchdog_server)
+    loop.run_until_complete(
         websockets.serve(ws_server_bound,
                          local_addr[0], local_addr[1],
                          max_size = constants.WS_MAX_MSG_SIZE_COMP, max_queue = None,
                          compression = 'deflate' if args.enable_compress else None,
                          **ssl_param))
-    asyncio.get_event_loop().run_forever()
+    loop.run_forever()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Wstunnel server')
@@ -233,5 +218,6 @@ if __name__ == "__main__":
     if args.log_file:
         logging_config_param['filename'] = args.log_file
     logging.basicConfig(**logging_config_param)
-    logging.getLogger(__name__).setLevel(log_level)
+    logger.setLevel(log_level)
+    wd.logger.setLevel(log_level)
     main(args)

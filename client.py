@@ -8,29 +8,21 @@ import constants
 # https://github.com/aaugustin/websockets
 import websockets
 
+import watchdog as wd
+
 logger = logging.getLogger(__name__)
 
-class ConnIdleTimeout(Exception):
-    pass
-
-class Watchdog:
-    def __init__(self, timeout, exc):
-        self.timeout = timeout
-        self.cnt = 0
-        self.exc = exc
-    
-    def reset(self):
-        self.cnt = 0
-    
-    async def start(self):
-        while True:
-            await asyncio.sleep(1)
-            self.cnt += 1
-            if self.cnt == self.timeout:
-                raise self.exc
-
 class BaseServer:
-    def __init__(self, client, f_write_to_transport, f_conn_lost, uri, certfile, client_cert, idle_timeout, compress):
+    def __init__(self,
+                 client,
+                 f_write_to_transport,
+                 f_conn_lost,
+                 uri,
+                 certfile,
+                 client_cert,
+                 idle_timeout,
+                 compress,
+                 watchdog_server):
         self.client = client
         self.done = False
         self.que = asyncio.Queue()
@@ -42,19 +34,29 @@ class BaseServer:
             ssl_param = {'ssl': ssl_context}
         else:
             ssl_param = dict()
-        asyncio.create_task(self.new_client(uri, ssl_param, f_write_to_transport, f_conn_lost, idle_timeout, compress))
+        asyncio.create_task(self.new_client(uri,
+                                            ssl_param,
+                                            f_write_to_transport,
+                                            f_conn_lost,
+                                            idle_timeout,
+                                            compress,
+                                            watchdog_server))
     
     def data_received(self, data):
-        mv = memoryview(data)
-        M = constants.WS_MAX_MSG_SIZE
-        for i in range(0, len(data), M):
-            self.que.put_nowait(mv[i:i+M])
+        self.que.put_nowait(memoryview(data))
     
     def shutdown(self):
         self.done = True
         self.que.put_nowait(None)
     
-    async def new_client(self, uri, ssl_param, f_write_to_transport, f_conn_lost, idle_timeout, compress):
+    async def new_client(self,
+                         uri,
+                         ssl_param,
+                         f_write_to_transport,
+                         f_conn_lost,
+                         idle_timeout,
+                         compress,
+                         watchdog_server):
         tasks = []
         try:
             async with websockets.connect(uri,
@@ -62,8 +64,10 @@ class BaseServer:
                                           compression = compress,
                                           **ssl_param) as ws:
                 if idle_timeout:
-                    watchdog = Watchdog(idle_timeout, ConnIdleTimeout(f"Connection {self.client} has idled"))
-                    tasks.append(asyncio.create_task(watchdog.start()))
+                    watchdog = wd.WatchdogClient(watchdog_server,
+                                                 idle_timeout,
+                                                 wd.IdleTimeout(f"Connection {self.client} has idled"))
+                    tasks.append(watchdog.start())
                 else:
                     watchdog = None
                 tasks.append(asyncio.create_task(self.ws_data_sender(ws, watchdog)))
@@ -73,7 +77,7 @@ class BaseServer:
                     exc = i.exception()
                     if exc:
                         raise exc
-        except (ConnIdleTimeout,
+        except (wd.IdleTimeout,
                 websockets.exceptions.ConnectionClosedOK) as e:
             logger.info(repr(e))
         except Exception as e:
@@ -85,6 +89,7 @@ class BaseServer:
                 f_conn_lost(self.client)
     
     async def ws_data_sender(self, ws, watchdog):
+        M = constants.WS_MAX_MSG_SIZE
         que = self.que
         while True:
             if watchdog:
@@ -93,19 +98,20 @@ class BaseServer:
             if data is None:
                 que.task_done()
                 return
-            await ws.send(data)
+            for i in range(0, len(data), M):
+                await ws.send(data[i:i+M])
             que.task_done()
     
     async def ws_data_receiver(self, ws, f_write_to_transport, watchdog):
-        while True:
+        async for data in ws:
             if watchdog:
                 watchdog.reset()
-            f_write_to_transport(await ws.recv(), self.client)
+            f_write_to_transport(data, self.client)
 
 class UdpServer:
-    def __init__(self, uri, certfile, client_cert, idle_timeout, compress):
+    def __init__(self, uri, certfile, client_cert, idle_timeout, compress, watchdog_server):
         self.base_servers = dict()
-        self.args = [uri, certfile, client_cert, idle_timeout, compress]
+        self.args = [uri, certfile, client_cert, idle_timeout, compress, watchdog_server]
     
     def connection_made(self, transport):
         self.transport = transport
@@ -130,8 +136,8 @@ class UdpServer:
         self.base_servers.pop(addr)
 
 class TcpServer(asyncio.Protocol):
-    def __init__(self, uri, certfile, client_cert, idle_timeout, compress):
-        self.args = [uri, certfile, client_cert, idle_timeout, compress]
+    def __init__(self, uri, certfile, client_cert, idle_timeout, compress, watchdog_server):
+        self.args = [uri, certfile, client_cert, idle_timeout, compress, watchdog_server]
         self.peername = None
         self.base = None
         self.transport = None
@@ -181,12 +187,14 @@ async def main(args):
         logger.warning('Secure connection is disabled')
     compress = 'deflate' if args.enable_compress else None
     loop = asyncio.get_running_loop()
+    watchdog_server = wd.WatchdogServer(loop).start()
     if protocol == 'udp':
         transport, _ = await loop.create_datagram_endpoint(lambda: UdpServer(uri,
                                                                              args.ca_certs,
                                                                              args.client_cert,
                                                                              args.idle_timeout,
-                                                                             compress),
+                                                                             compress,
+                                                                             watchdog_server),
                                                            local_addr = local_addr
                                                           )
         try:
@@ -198,7 +206,8 @@ async def main(args):
                                                             args.ca_certs,
                                                             args.client_cert,
                                                             args.idle_timeout,
-                                                            compress),
+                                                            compress,
+                                                            watchdog_server),
                                           local_addr[0], local_addr[1]
                                          )
         async with server:
@@ -230,5 +239,6 @@ if __name__ == "__main__":
     if args.log_file:
         logging_config_param['filename'] = args.log_file
     logging.basicConfig(**logging_config_param)
-    logging.getLogger(__name__).setLevel(log_level)
+    logger.setLevel(log_level)
+    wd.logger.setLevel(log_level)
     asyncio.run(main(args))
