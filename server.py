@@ -87,7 +87,7 @@ def verify_token(expected, received, default):
 
 async def ws_server(ws, path, routes, idle_timeout, watchdog_server):
     peername = ws.transport.get_extra_info("peername")
-    logger.debug(f'New Websocket connection from {peername}, path={path}')
+    logger.debug(f'New Websocket connection from {peername}')
     path = urlparse(path)
     try:
         received_token = parse_qs(path.query)['t'][0]
