@@ -7,6 +7,7 @@ from urllib.parse import urlencode, urlparse, urlunparse
 import websockets
 import constants
 import watchdog as wd
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -251,4 +252,15 @@ if __name__ == "__main__":
     logging.basicConfig(**logging_config_param)
     logger.setLevel(log_level)
     wd.logger.setLevel(log_level)
-    asyncio.run(main(args))
+
+    if sys.platform == 'cygwin':
+        # For windows, with no uvloop support
+        asyncio.run(main(args))
+    elif sys.version_info >= (3, 11):
+        import uvloop
+        with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
+            runner.run(main(args))
+    else:
+        import uvloop
+        uvloop.install()
+        asyncio.run(main(args))
